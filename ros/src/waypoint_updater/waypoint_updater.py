@@ -9,6 +9,8 @@ from enum import Enum
 
 import math
 
+from threading import Lock
+
 '''
 This node will publish waypoints from the car's current position to some `x` distance ahead.
 
@@ -48,13 +50,8 @@ class WaypointUpdater(object):
         GO = 1
 
     def __init__(self):
+        rospy.logdebug('Starting up node...');
         rospy.init_node('waypoint_updater', log_level=rospy.DEBUG)
-
-        rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb, queue_size=1)
-        rospy.Subscriber('/current_velocity', TwistStamped, self.twist_cb, queue_size=1)
-        rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
-
-        sub1 = rospy.Subscriber("/traffic_waypoint", TrafficWaypoint, self.traffic_cb)
 
         self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
 
@@ -70,6 +67,16 @@ class WaypointUpdater(object):
 
         self.state = WaypointUpdater.State.STOP;
 
+        self.mutex = Lock()
+
+        rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb, queue_size=1)
+        rospy.Subscriber('/current_velocity', TwistStamped, self.twist_cb, queue_size=1)
+        rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
+
+        sub1 = rospy.Subscriber("/traffic_waypoint", TrafficWaypoint, self.traffic_cb)
+
+
+        rospy.logdebug('Fully initialized, about to spin');
         rospy.spin()
 
     def update_state(self, distanceToLight):
@@ -88,12 +95,16 @@ class WaypointUpdater(object):
 
         elif (self.state == WaypointUpdater.State.STOP):
             lightIsGreen = (self.lightstate == TrafficWaypoint.GREEN);
+            lightIsUnknown = (self.lightstate == TrafficWaypoint.UNKNOWN);
 
-            if (failedToDetectLight or lightIsGreen):
+            if (failedToDetectLight):
+                pass;
+            elif (lightIsGreen or lightIsUnknown):
                 self.state = WaypointUpdater.State.GO;
 
         else:
-            assert(False); # Unknown state
+            rospy.logerr('Unexpected state {}, resetting to STOP'.format (self.state))
+            self.state = WaypointUpdater.State.STOP;
 
     def execute_state(self, lane, numwpts):
         if (self.state == WaypointUpdater.State.GO):
@@ -127,60 +138,60 @@ class WaypointUpdater(object):
         '''
         :param msg: Current position of the vehicle of type PoseStamped
         '''
+        with self.mutex:
+            lane = Lane();
 
-        lane = Lane();
+            # Pass through the header info
+            lane.header = msg.header
 
-        # Pass through the header info
-        lane.header = msg.header
+            startwpindex = self.find_closest_waypoint(self.base_waypoints, msg.pose);
 
-        startwpindex = self.find_closest_waypoint(self.base_waypoints, msg.pose);
+            if (startwpindex < 0):
+                rospy.logerr('pose_cb: start index invalid');
+                return;
 
-        for i in range (LOOKAHEAD_WPS):
-            lane.waypoints.append (self.base_waypoints[(startwpindex + i) % len(self.base_waypoints)]);
-            self.set_waypoint_velocity(lane.waypoints, i, self.SPEED_LIMIT);
+            for i in range (LOOKAHEAD_WPS):
+                lane.waypoints.append (self.base_waypoints[(startwpindex + i) % len(self.base_waypoints)]);
+                self.set_waypoint_velocity(lane.waypoints, i, self.SPEED_LIMIT);
 
-        numwpts = 0;
-        distanceToLight = 0;
+            numwpts = 0;
+            distanceToLight = 0;
 
-        if (self.lightindex < 0):
-            numwpts = LOOKAHEAD_WPS;
-            distanceToLight = 10000;
-        elif (startwpindex <= self.lightindex):
-            numwpts = self.lightindex - startwpindex;
-            distanceToLight = self.distance(lane.waypoints, 0, min(LOOKAHEAD_WPS, numwpts)-1);
-        else:
-            numwpts = self.lightindex + len(self.base_waypoints) - startwpindex;
-            distanceToLight = self.distance(lane.waypoints, 0, min(LOOKAHEAD_WPS, numwpts)-1);
+            if (self.lightindex < 0):
+                numwpts = 0;
+                distanceToLight = 10000;
+            elif (startwpindex <= self.lightindex):
+                numwpts = self.lightindex - startwpindex;
+                distanceToLight = self.distance(lane.waypoints, 0, min(LOOKAHEAD_WPS, numwpts)-1);
+            else:
+                numwpts = self.lightindex + len(self.base_waypoints) - startwpindex;
+                distanceToLight = self.distance(lane.waypoints, 0, min(LOOKAHEAD_WPS, numwpts)-1);
 
-        self.update_state(distanceToLight);
-        self.execute_state(lane, numwpts);
+            if (startwpindex > self.lightindex):
+                self.lightstate = TrafficWaypoint.UNKNOWN;
 
-        #rospy.logwarn('state {} v0 {:+6.3f} numwpts {} start {} end {}'.format(
-        #    self.state, self.get_waypoint_velocity(lane.waypoints[0]),
-        #    numwpts, startwpindex, self.lightindex))
-        return;
+            self.update_state(distanceToLight);
+            self.execute_state(lane, numwpts);
+
+            #rospy.logwarn('state {} v0 {:+6.3f} numwpts {} start {} end {}'.format(
+            #    self.state, self.get_waypoint_velocity(lane.waypoints[0]),
+            #    numwpts, startwpindex, self.lightindex))
+            return;
 
     def twist_cb(self, msg):
-        self.last_velocity = msg.twist.linear.x;
+        with self.mutex:
+            self.last_velocity = msg.twist.linear.x;
 
     def waypoints_cb(self, waypoints):
-        self.base_waypoints = waypoints.waypoints;
+        with self.mutex:
+            self.base_waypoints = waypoints.waypoints;
 
     def traffic_cb(self, msg):
         # This is the index of the nearest upcoming red light
         # Used in pose_cb
-        self.lightindex = msg.index;
-        self.lightstate = msg.state;
-
-        #if msg.state == TrafficWaypoint.RED:
-        #    state = "red"
-        #elif msg.state == TrafficWaypoint.YELLOW:
-        #    state = "yellow"
-        #elif msg.state == TrafficWaypoint.GREEN:
-        #    state = "green"
-        #else:
-        #    state = "unknown"
-        #rospy.logdebug('traffic light; waypoint: {}; state: {}'.format(msg.index, state))
+        with self.mutex:
+            self.lightindex = msg.index;
+            self.lightstate = msg.state;
 
     def obstacle_cb(self, msg):
         # TODO: Callback for /obstacle_waypoint message. We will implement it later
@@ -237,7 +248,8 @@ class WaypointUpdater(object):
             closestDistSquared = testDistSquared;
             closestIndex = i;
 
-        assert(closestIndex >= 0);
+        if (closestIndex < 0):
+            rospy.logerr('find_closest_waypoint: no waypoint could be found');
 
         return closestIndex;
 
